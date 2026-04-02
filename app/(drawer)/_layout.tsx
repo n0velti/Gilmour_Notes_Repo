@@ -3,6 +3,7 @@ import { Drawer } from 'expo-router/drawer';
 import { router } from 'expo-router';
 import { useEffect } from 'react';
 import { Dimensions, StyleSheet } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppDrawerContent } from '@/components/app-drawer-content';
 import { BW } from '@/constants/monochrome';
@@ -12,6 +13,7 @@ const DRAWER_WIDTH = Math.min(Dimensions.get('window').width * 0.78, 276);
 
 export default function DrawerLayout() {
   const { session, initialized } = useAuth();
+  const insets = useSafeAreaInsets();
 
   useEffect(() => {
     if (!initialized) return;
@@ -29,6 +31,8 @@ export default function DrawerLayout() {
         headerTintColor: BW.fg,
         headerTitleStyle: { fontWeight: '500', color: BW.fg, fontSize: 17 },
         headerShadowVisible: false,
+        headerLeftContainerStyle: { paddingLeft: 4 + insets.left },
+        headerRightContainerStyle: { paddingRight: 4 + insets.right },
         headerLeft: (props) => <DrawerToggleButton {...props} tintColor={BW.fg} />,
         drawerPosition: 'left',
         drawerType: 'slide',

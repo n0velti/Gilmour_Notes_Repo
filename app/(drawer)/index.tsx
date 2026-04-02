@@ -1,10 +1,11 @@
-import DateTimePicker from '@react-native-community/datetimepicker';
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import { HeaderHeightContext } from '@react-navigation/elements';
 import { useFocusEffect } from '@react-navigation/native';
 import { DrawerToggleButton, useDrawerStatus } from '@react-navigation/drawer';
 import { router, useNavigation } from 'expo-router';
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -14,28 +15,46 @@ import {
 } from 'react';
 import {
   Alert,
+  Animated,
   Keyboard,
   KeyboardAvoidingView,
-  Modal,
   Platform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { ScrollView } from 'react-native-gesture-handler';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NoteDueIndicator } from '@/components/note-due-indicator';
+import { NoteSwipeableRow } from '@/components/note-swipeable-row';
 import { BW } from '@/constants/monochrome';
+import { useAuth } from '@/contexts/auth-context';
+import {
+  dbNoteToBlock,
+  deleteNote,
+  fetchNotesForUser,
+  insertNote,
+  isNotesTableMissingError,
+  NOTES_TABLE_SETUP_HINT,
+  updateNoteBody,
+} from '@/lib/notes';
+import { calendarDaysDelta } from '@/lib/note-due-format';
+import { randomUUID } from '@/lib/random-id';
 
 const IS_NATIVE = Platform.OS === 'ios' || Platform.OS === 'android';
-/** Tight strip — visually “on” the keyboard */
-const ACCESSORY_HEIGHT = 38;
+/** Keyboard accessory bar height (matches circular controls + padding). */
+const ACCESSORY_HEIGHT = 48;
 const MENU_GAP = 0;
 /** Pulls the keybar down over the keyboard top */
 const ACCESSORY_BOTTOM_INSET = 18;
+/** Due ring: single-line row; slightly smaller than text line for balance. */
+const NOTE_DUE_SIZE = 36;
+/** Text field height + vertical padding on `noteRowWrap` (`paddingVertical` × 2). */
+const NOTE_ROW_MIN_HEIGHT = 40 + 10;
 
 type Block = {
   id: string;
@@ -51,9 +70,7 @@ type Block = {
 type SortMode = 'time' | 'dueAsc' | 'dueDesc';
 
 function createdSortKey(b: Block): number {
-  if (b.createdAt != null) return b.createdAt;
-  const m = /^note-(\d+)$/.exec(b.id);
-  return m ? parseInt(m[1], 10) : 0;
+  return b.createdAt ?? 0;
 }
 
 function compareDue(a: Block, b: Block, dir: 'asc' | 'desc'): number {
@@ -79,63 +96,130 @@ function sortBlocks(list: Block[], mode: SortMode): Block[] {
   return copy.sort((a, b) => compareDue(a, b, 'desc'));
 }
 
-function startOfDayMs(d: Date): number {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x.getTime();
-}
-
-function calendarDaysLeft(dueAt: number): number {
-  const t = startOfDayMs(new Date());
-  const d = startOfDayMs(new Date(dueAt));
-  return Math.max(0, Math.round((d - t) / 86400000));
-}
-
 function ringProgress(dueAt: number, anchorAt: number): number {
   const total = Math.max(dueAt - anchorAt, 60_000);
   const left = dueAt - Date.now();
   return Math.max(0, Math.min(1, left / total));
 }
 
-function endOfDueDayMs(d: Date): number {
-  const x = new Date(d);
-  x.setHours(23, 59, 59, 999);
-  return x.getTime();
+/** e.g. `Thurs: 2-Apr-2026` */
+function formatHeaderDate(d: Date = new Date()): string {
+  const weekdayLabels = [
+    'Sun',
+    'Mon',
+    'Tues',
+    'Wed',
+    'Thurs',
+    'Fri',
+    'Sat',
+  ] as const;
+  const monthLabels = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ] as const;
+  const w = weekdayLabels[d.getDay()];
+  const day = d.getDate();
+  const m = monthLabels[d.getMonth()];
+  const y = d.getFullYear();
+  return `${w}: ${day}-${m}-${y}`;
 }
 
-function formatTodayShort(): string {
-  const d = new Date();
-  return d.toLocaleDateString(undefined, {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
+/** Very subtle resting separator (thin light black). */
+const NOTE_LINE_SUBTLE = 'rgba(0,0,0,0.08)';
+
+/** Thicker, darker line that pulsates height + opacity when a note is focused. */
+function NoteHairlinePulse({ pulse }: { pulse: Animated.Value }) {
+  const height = pulse.interpolate({
+    inputRange: [0.35, 1],
+    outputRange: [1, 2.75],
   });
-}
-
-let idCounter = 0;
-function nextId(): string {
-  idCounter += 1;
-  return `note-${idCounter}`;
+  const opacity = pulse.interpolate({
+    inputRange: [0.35, 1],
+    outputRange: [0.4, 1],
+  });
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={{
+        width: '100%',
+        height,
+        backgroundColor: BW.fg,
+        opacity,
+      }}
+    />
+  );
 }
 
 export default function NotesScreen() {
   const navigation = useNavigation();
+  const { session, initialized } = useAuth();
+  /** Fallback when header context is missing (avoids throw from useHeaderHeight on some layouts). */
+  const headerHeight = useContext(HeaderHeightContext) ?? 56;
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const drawerStatus = useDrawerStatus();
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
-  const [dateLabel, setDateLabel] = useState(formatTodayShort);
-  const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
-  const [duePickerBlockId, setDuePickerBlockId] = useState<string | null>(null);
-  const [duePickerTemp, setDuePickerTemp] = useState(() => new Date());
+  const [dateLabel, setDateLabel] = useState(() => formatHeaderDate());
   const [sortMode, setSortMode] = useState<SortMode>('time');
   const inputRefs = useRef<Record<string, TextInput | null>>({});
-  const duePickerBlockRef = useRef<string | null>(null);
+  const bodySaveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
+  const noteFocusPulse = useRef(new Animated.Value(0.35)).current;
+
+  useEffect(() => {
+    if (!focusedNoteId) {
+      noteFocusPulse.stopAnimation();
+      noteFocusPulse.setValue(0);
+      return;
+    }
+    noteFocusPulse.setValue(0.35);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(noteFocusPulse, {
+          toValue: 1,
+          duration: 600,
+          useNativeDriver: false,
+        }),
+        Animated.timing(noteFocusPulse, {
+          toValue: 0.35,
+          duration: 600,
+          useNativeDriver: false,
+        }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [focusedNoteId, noteFocusPulse]);
 
   const displayedBlocks = useMemo(
     () => sortBlocks(blocks, sortMode),
     [blocks, sortMode]
+  );
+
+  /** Fills the scroll body so the filler Pressable can expand to the bottom of the screen. */
+  const scrollContentStyle = useMemo(
+    () => [
+      styles.scrollContentGrow,
+      {
+        minHeight: Math.max(
+          0,
+          windowHeight - headerHeight - insets.bottom
+        ),
+      },
+    ],
+    [windowHeight, headerHeight, insets.bottom]
   );
 
   const cycleSortMode = useCallback(() => {
@@ -145,17 +229,47 @@ export default function NotesScreen() {
   }, []);
 
   useEffect(() => {
-    duePickerBlockRef.current = duePickerBlockId;
-  }, [duePickerBlockId]);
+    if (!initialized) return;
+    if (!session?.user?.id) {
+      setBlocks([]);
+    }
+  }, [initialized, session?.user?.id]);
 
-  const hasAnyContent = blocks.some((b) => b.text.trim().length > 0);
+  useEffect(() => {
+    return () => {
+      Object.values(bodySaveTimers.current).forEach(clearTimeout);
+      bodySaveTimers.current = {};
+    };
+  }, []);
+
   /** Cannot add another row while an empty note row exists */
   const canAddNote = !blocks.some((b) => b.text.trim() === '');
 
   useFocusEffect(
     useCallback(() => {
-      setDateLabel(formatTodayShort());
-    }, [])
+      setDateLabel(formatHeaderDate());
+      if (!initialized || !session?.user?.id) return;
+      let cancelled = false;
+      (async () => {
+        try {
+          const rows = await fetchNotesForUser();
+          if (cancelled) return;
+          setBlocks((prev) => {
+            const serverBlocks = rows.map(dbNoteToBlock);
+            const serverIds = new Set(serverBlocks.map((b) => b.id));
+            const pendingLocal = prev.filter((b) => !serverIds.has(b.id));
+            return [...serverBlocks, ...pendingLocal];
+          });
+        } catch (e) {
+          if (!isNotesTableMissingError(e)) {
+            console.error('Failed to load notes', e);
+          }
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [initialized, session?.user?.id])
   );
 
   useEffect(() => {
@@ -166,7 +280,10 @@ export default function NotesScreen() {
 
   useLayoutEffect(() => {
     navigation.setOptions({
-      headerLeftContainerStyle: styles.headerLeftContainer,
+      headerLeftContainerStyle: [
+        styles.headerLeftContainer,
+        { paddingLeft: 4 + insets.left },
+      ],
       headerLeft: (props: ComponentProps<typeof DrawerToggleButton>) => (
         <View style={styles.headerLeftRow}>
           <DrawerToggleButton {...props} tintColor={BW.fg} />
@@ -176,18 +293,36 @@ export default function NotesScreen() {
             hitSlop={8}>
             <Text
               style={styles.headerDateTextLeft}
-              numberOfLines={2}
+              numberOfLines={1}
+              ellipsizeMode="tail"
               {...(Platform.OS === 'ios'
-                ? { adjustsFontSizeToFit: true, minimumFontScale: 0.75 }
+                ? { adjustsFontSizeToFit: true, minimumFontScale: 0.72 }
                 : {})}>
               {dateLabel}
             </Text>
           </Pressable>
         </View>
       ),
-      headerRightContainerStyle: styles.headerRightContainer,
+      headerTitle: () => null,
+      headerTitleContainerStyle: {
+        flex: 0,
+        width: 0,
+        maxWidth: 0,
+        margin: 0,
+        padding: 0,
+        overflow: 'hidden',
+      },
+      headerRightContainerStyle: [
+        styles.headerRightContainer,
+        /**
+         * Match `noteRowWrap` horizontal padding (16). Header already applies
+         * `marginEnd: insets.right` on the right slot — do not add insets again here
+         * or the sort control sits left of the due indicators.
+         */
+        { paddingRight: 16 },
+      ],
       headerRight: () => (
-        <View style={styles.headerRight}>
+        <View style={styles.headerRightRow}>
           {Platform.OS === 'web' ? (
             <Pressable
               onPress={() => setPlusMenuOpen(true)}
@@ -222,7 +357,7 @@ export default function NotesScreen() {
         </View>
       ),
     });
-  }, [navigation, dateLabel, cycleSortMode, sortMode]);
+  }, [navigation, dateLabel, cycleSortMode, sortMode, insets.left]);
 
   useEffect(() => {
     if (!IS_NATIVE) return;
@@ -244,13 +379,63 @@ export default function NotesScreen() {
   }, []);
 
   const focusBlockById = (id: string) => {
-    requestAnimationFrame(() => {
-      inputRefs.current[id]?.focus();
-    });
+    const tryFocus = (attemptsLeft: number) => {
+      const input = inputRefs.current[id];
+      if (input) {
+        input.focus();
+        return;
+      }
+      if (attemptsLeft <= 0) return;
+      requestAnimationFrame(() => tryFocus(attemptsLeft - 1));
+    };
+    requestAnimationFrame(() => tryFocus(12));
   };
+
+  const scheduleBodySave = useCallback(
+    (id: string, text: string) => {
+      const uid = session?.user?.id;
+      if (!uid) return;
+      const prevT = bodySaveTimers.current[id];
+      if (prevT) clearTimeout(prevT);
+      bodySaveTimers.current[id] = setTimeout(() => {
+        delete bodySaveTimers.current[id];
+        updateNoteBody(id, text).catch((e) => console.error('Failed to save note', e));
+      }, 450);
+    },
+    [session?.user?.id]
+  );
+
+  const createBlockAndInsert = useCallback(
+    async (initialText: string) => {
+      const id = randomUUID();
+      const createdAt = Date.now();
+      const uid = session?.user?.id;
+      if (uid) {
+        try {
+          await insertNote({ id, userId: uid, body: initialText, createdAtMs: createdAt });
+        } catch (e) {
+          if (isNotesTableMissingError(e)) {
+            Alert.alert('Database setup', NOTES_TABLE_SETUP_HINT);
+          } else {
+            Alert.alert('Could not save note', 'Check your connection and try again.');
+          }
+          return;
+        }
+      }
+      setBlocks((prev) => [...prev, { id, text: initialText, createdAt }]);
+      queueMicrotask(() => focusBlockById(id));
+    },
+    [session?.user?.id]
+  );
 
   const onChangeBlockById = (id: string, text: string) => {
     if (text === '') {
+      const t = bodySaveTimers.current[id];
+      if (t) clearTimeout(t);
+      delete bodySaveTimers.current[id];
+      if (session?.user?.id) {
+        deleteNote(id).catch((e) => console.error('Failed to delete note', e));
+      }
       setBlocks((prev) => {
         const idx = prev.findIndex((b) => b.id === id);
         if (idx < 0) return prev;
@@ -272,53 +457,25 @@ export default function NotesScreen() {
     setBlocks((prev) =>
       prev.map((b) => (b.id === id ? { ...b, text } : b))
     );
+    scheduleBodySave(id, text);
   };
 
-  const appendBlock = () => {
+  const appendBlock = useCallback(() => {
     if (!canAddNote) return;
-    const id = nextId();
-    const createdAt = Date.now();
-    setBlocks((prev) => {
-      const next = [...prev, { id, text: '', createdAt }];
-      return next;
-    });
-    focusBlockById(id);
-  };
+    void createBlockAndInsert('');
+  }, [canAddNote, createBlockAndInsert]);
 
-  const applyDueDate = (blockId: string, picked: Date) => {
-    const dueAt = endOfDueDayMs(picked);
-    const dueAnchorAt = Date.now();
-    setBlocks((prev) =>
-      prev.map((b) =>
-        b.id === blockId ? { ...b, dueAt, dueAnchorAt } : b
-      )
-    );
-  };
-
-  const openDuePickerFor = (blockId: string, block: Block) => {
-    if (Platform.OS === 'web') {
-      Alert.alert('Due date', 'Set due dates in the iOS or Android app.');
+  /** Tap empty area: add note if allowed, otherwise focus the empty row so the keyboard opens. */
+  const onTapAddOrFocusEmpty = useCallback(() => {
+    if (canAddNote) {
+      appendBlock();
       return;
     }
-    const base =
-      block.dueAt != null ? new Date(block.dueAt) : new Date(Date.now() + 86400000);
-    setDuePickerTemp(base);
-    setDuePickerBlockId(blockId);
-  };
-
-  const closeDuePicker = (refocusId: string | null) => {
-    setDuePickerBlockId(null);
-    if (refocusId) {
-      queueMicrotask(() => focusBlockById(refocusId));
+    const empty = blocks.find((b) => b.text.trim() === '');
+    if (empty) {
+      setTimeout(() => focusBlockById(empty.id), 50);
     }
-  };
-
-  const confirmDuePicker = () => {
-    const id = duePickerBlockId;
-    if (!id) return;
-    applyDueDate(id, duePickerTemp);
-    closeDuePicker(id);
-  };
+  }, [canAddNote, blocks, appendBlock]);
 
   const iosInputProps =
     Platform.OS === 'ios'
@@ -336,6 +493,14 @@ export default function NotesScreen() {
     Alert.alert('AI', 'AI tools will be available here.');
   };
 
+  const openNoteDetails = (blockId: string) => {
+    Keyboard.dismiss();
+    router.push({
+      pathname: '/note-details',
+      params: { noteId: blockId },
+    });
+  };
+
   const onPlusMenuDate = () => {
     setPlusMenuOpen(false);
     router.push('/(drawer)/calendar');
@@ -343,27 +508,29 @@ export default function NotesScreen() {
 
   const onPlusMenuUrgent = () => {
     setPlusMenuOpen(false);
+    if (blocks.length === 0) {
+      void createBlockAndInsert('[URGENT] ');
+      return;
+    }
     setBlocks((prev) => {
-      if (prev.length === 0) {
-        const id = nextId();
-        const createdAt = Date.now();
-        queueMicrotask(() => focusBlockById(id));
-        return [{ id, text: '[URGENT] ', createdAt }];
-      }
       const next = [...prev];
       const last = next.length - 1;
-      next[last] = {
-        ...next[last],
-        text: next[last].text.trim() ? `${next[last].text}\n[URGENT] ` : '[URGENT] ',
-      };
+      const newText = next[last].text.trim()
+        ? `${next[last].text.trim()} [URGENT] `
+        : '[URGENT] ';
+      next[last] = { ...next[last], text: newText };
       const lid = next[last].id;
       queueMicrotask(() => focusBlockById(lid));
+      if (session?.user?.id) {
+        updateNoteBody(lid, newText).catch((e) =>
+          console.error('Failed to save note', e)
+        );
+      }
       return next;
     });
   };
 
   const showAccessory = IS_NATIVE && keyboardHeight > 0;
-  const keyboardClosed = !showAccessory;
 
   return (
     <SafeAreaView style={styles.safe} edges={['bottom', 'left', 'right']}>
@@ -374,23 +541,24 @@ export default function NotesScreen() {
           keyboardVerticalOffset={0}>
           <ScrollView
             style={styles.scroll}
-            contentContainerStyle={styles.scrollContentGrow}
-            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={scrollContentStyle}
+            keyboardShouldPersistTaps="always"
             keyboardDismissMode="on-drag">
             {blocks.length === 0 ? (
               <Pressable
                 style={({ pressed }) => [
-                  styles.addRowFullWidth,
+                  styles.addNoteArea,
+                  styles.addNoteAreaFill,
                   !canAddNote && styles.addRowDisabled,
-                  pressed && canAddNote && { opacity: 0.6 },
+                  pressed && styles.addNoteAreaPressed,
                 ]}
-                onPress={appendBlock}
-                disabled={!canAddNote}
+                onPress={onTapAddOrFocusEmpty}
                 hitSlop={{ top: 14, bottom: 14, left: 8, right: 8 }}>
                 <View style={styles.addRowInner}>
-                  <MaterialIcons name="add" size={20} color={BW.muted} />
-                  <Text style={styles.addRowText}>add new note</Text>
+                  <MaterialIcons name="add" size={20} color={BW.fg} />
+                  <Text style={styles.addRowTextEmphasis}>add new note</Text>
                 </View>
+                <View style={styles.addNoteAreaSpacer} />
               </Pressable>
             ) : (
               <>
@@ -404,93 +572,105 @@ export default function NotesScreen() {
                     hasDue && block.dueAt != null
                       ? ringProgress(block.dueAt, anchorAt)
                       : 0;
-                  const daysLeftNum =
-                    block.dueAt != null ? calendarDaysLeft(block.dueAt) : 0;
-                  const showRowTools =
-                    focusedBlockId === block.id || duePickerBlockId === block.id;
+                  const dueDeltaDays =
+                    block.dueAt != null ? calendarDaysDelta(block.dueAt) : 0;
                   const isFirstInList = displayedBlocks[0]?.id === block.id;
+
+                  const rowFocused = focusedNoteId === block.id;
+                  const isLastInList = index === displayedBlocks.length - 1;
+                  const prevId =
+                    index > 0 ? displayedBlocks[index - 1]?.id : undefined;
+                  /** Line above this row: list top (index 0) or shared boundary with previous note. */
+                  const pulseTopHairline =
+                    index === 0
+                      ? rowFocused
+                      : rowFocused || focusedNoteId === prevId;
+                  /** Line below last note only (boundary before add area). */
+                  const pulseBottomHairline = isLastInList && rowFocused;
 
                   return (
                     <View key={block.id} style={styles.noteBlock}>
-                      <View style={styles.noteRow}>
-                        <TextInput
-                          ref={(r) => {
-                            inputRefs.current[block.id] = r;
-                          }}
-                          style={styles.blockInput}
-                          multiline
-                          placeholder={isFirstInList ? 'Tap to type…' : ''}
-                          placeholderTextColor={BW.muted}
-                          value={block.text}
-                          onChangeText={(t) => onChangeBlockById(block.id, t)}
-                          onFocus={() => setFocusedBlockId(block.id)}
-                          onBlur={() =>
-                            setFocusedBlockId((cur) =>
-                              cur === block.id ? null : cur
+                      <NoteSwipeableRow
+                        onDelete={() => onChangeBlockById(block.id, '')}>
+                        <View style={styles.noteRowChrome}>
+                          {pulseTopHairline ? (
+                            <NoteHairlinePulse pulse={noteFocusPulse} />
+                          ) : (
+                            <View style={styles.noteHairlineIdle} />
+                          )}
+                          <View style={styles.noteRowWrap}>
+                            <View style={styles.noteLeftCol}>
+                              <TextInput
+                                ref={(r) => {
+                                  inputRefs.current[block.id] = r;
+                                }}
+                                style={styles.blockInput}
+                                multiline={false}
+                                numberOfLines={1}
+                                placeholder={isFirstInList ? 'Tap to type…' : ''}
+                                placeholderTextColor={BW.muted}
+                                value={block.text}
+                                onChangeText={(t) =>
+                                  onChangeBlockById(block.id, t.replace(/\r?\n/g, ' '))
+                                }
+                                onFocus={() => setFocusedNoteId(block.id)}
+                                onBlur={() =>
+                                  setFocusedNoteId((cur) =>
+                                    cur === block.id ? null : cur
+                                  )
+                                }
+                                scrollEnabled={false}
+                                {...(Platform.OS === 'android'
+                                  ? { textAlignVertical: 'center' as const }
+                                  : {})}
+                                {...iosInputProps}
+                              />
+                            </View>
+                            <View style={styles.noteDueColumn}>
+                              <NoteDueIndicator
+                                hasDue={hasDue}
+                                dueDeltaDays={dueDeltaDays}
+                                progress={progress}
+                                size={NOTE_DUE_SIZE}
+                                onPress={() => openNoteDetails(block.id)}
+                                style={styles.noteDueIndicatorRoot}
+                              />
+                            </View>
+                          </View>
+                          {isLastInList ? (
+                            pulseBottomHairline ? (
+                              <NoteHairlinePulse pulse={noteFocusPulse} />
+                            ) : (
+                              <View style={styles.noteHairlineIdle} />
                             )
-                          }
-                          textAlignVertical="top"
-                          scrollEnabled={false}
-                          {...iosInputProps}
-                        />
-                        <NoteDueIndicator
-                          hasDue={hasDue}
-                          daysLeft={daysLeftNum}
-                          progress={progress}
-                          onPress={() => openDuePickerFor(block.id, block)}
-                        />
-                      </View>
-                      {showRowTools ? (
-                        <View style={styles.noteRowToolbar}>
-                          <Pressable
-                            style={({ pressed }) => [
-                              styles.toolBtn,
-                              pressed && { opacity: 0.65 },
-                            ]}
-                            onPress={() =>
-                              Alert.alert('AI', 'AI tools for this note will go here.')
-                            }
-                            hitSlop={6}>
-                            <Text style={styles.toolBtnText}>AI</Text>
-                          </Pressable>
+                          ) : null}
                         </View>
-                      ) : null}
-                      {index < displayedBlocks.length - 1 ? (
-                        <View style={styles.blockDivider} />
-                      ) : null}
+                      </NoteSwipeableRow>
                     </View>
                   );
                 })}
 
-                {hasAnyContent ? (
-                  <View style={styles.addSection}>
-                    <View style={styles.faintLine} />
-                    <Pressable
-                      style={({ pressed }) => [
-                        styles.addRowFullWidth,
-                        !canAddNote && styles.addRowDisabled,
-                        pressed && canAddNote && { opacity: 0.55 },
-                      ]}
-                      onPress={appendBlock}
-                      disabled={!canAddNote}
-                      hitSlop={{ top: 14, bottom: 14, left: 8, right: 8 }}>
-                      <View style={styles.addRowInner}>
-                        <MaterialIcons name="add" size={18} color={BW.muted} />
-                        <Text style={styles.addRowText}>add new note</Text>
-                      </View>
-                    </Pressable>
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.addNoteArea,
+                    {
+                      minHeight: Math.max(
+                        280,
+                        windowHeight - headerHeight - insets.bottom - 80
+                      ),
+                    },
+                    Platform.OS === 'web' ? { cursor: 'pointer' as const } : null,
+                    pressed && styles.addNoteAreaPressed,
+                  ]}
+                  onPress={onTapAddOrFocusEmpty}
+                  accessibilityRole="button"
+                  accessibilityLabel="Add new note">
+                  <View style={styles.addRowInner}>
+                    <MaterialIcons name="add" size={18} color={BW.fg} />
+                    <Text style={styles.addRowTextEmphasis}>add new note</Text>
                   </View>
-                ) : null}
-
-                {keyboardClosed ? (
-                  <Pressable
-                    style={styles.belowNotesTap}
-                    disabled={!canAddNote}
-                    pointerEvents={canAddNote ? 'auto' : 'none'}
-                    onPress={appendBlock}
-                    accessibilityLabel="Add new note"
-                  />
-                ) : null}
+                  <View style={styles.addNoteAreaSpacer} />
+                </Pressable>
               </>
             )}
           </ScrollView>
@@ -506,27 +686,31 @@ export default function NotesScreen() {
               },
             ]}
             pointerEvents="box-none">
-            <Pressable
-              style={({ pressed }) => [styles.accBtn, pressed && styles.sqBtnPressed]}
-              onPress={() => setPlusMenuOpen(true)}
-              accessibilityLabel="More options"
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <MaterialIcons name="add" size={22} color={BW.muted} />
-            </Pressable>
-            <Pressable
-              style={({ pressed }) => [styles.accBtn, pressed && styles.sqBtnPressed]}
-              onPress={() => Keyboard.dismiss()}
-              accessibilityLabel="Hide keyboard"
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <MaterialIcons name="keyboard-arrow-down" size={22} color={BW.muted} />
-            </Pressable>
-            <Pressable
-              style={({ pressed }) => [styles.accBtn, pressed && styles.sqBtnPressed]}
-              onPress={() => {}}
-              accessibilityLabel="Microphone"
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <MaterialIcons name="mic" size={20} color={BW.muted} />
-            </Pressable>
+            <View style={styles.accAccessoryLeft}>
+              <Pressable
+                style={({ pressed }) => [styles.accCircleBtn, pressed && styles.accCirclePressed]}
+                onPress={() => setPlusMenuOpen(true)}
+                accessibilityLabel="More options"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <MaterialIcons name="add" size={18} color={BW.muted} />
+              </Pressable>
+            </View>
+            <View style={styles.accAccessoryRight}>
+              <Pressable
+                style={({ pressed }) => [styles.accCircleBtn, pressed && styles.accCirclePressed]}
+                onPress={() => {}}
+                accessibilityLabel="Microphone"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <MaterialIcons name="mic" size={18} color={BW.muted} />
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [styles.accCircleBtn, pressed && styles.accCirclePressed]}
+                onPress={() => Keyboard.dismiss()}
+                accessibilityLabel="Hide keyboard"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <MaterialIcons name="keyboard-arrow-down" size={18} color={BW.muted} />
+              </Pressable>
+            </View>
           </View>
         ) : null}
 
@@ -568,62 +752,6 @@ export default function NotesScreen() {
           </View>
         ) : null}
 
-        {duePickerBlockId && Platform.OS === 'android' ? (
-          <DateTimePicker
-            value={duePickerTemp}
-            mode="date"
-            display="default"
-            minimumDate={new Date()}
-            onChange={(ev, date) => {
-              const id = duePickerBlockRef.current;
-              if (ev.type === 'dismissed' || !id) {
-                closeDuePicker(id);
-                return;
-              }
-              if (ev.type === 'set' && date) {
-                applyDueDate(id, date);
-                closeDuePicker(id);
-              }
-            }}
-          />
-        ) : null}
-
-        {duePickerBlockId && Platform.OS === 'ios' ? (
-          <Modal
-            visible
-            transparent
-            animationType="fade"
-            onRequestClose={() => closeDuePicker(duePickerBlockId)}>
-            <View style={styles.dateModalRoot}>
-              <Pressable
-                style={styles.dateModalBackdrop}
-                onPress={() => closeDuePicker(duePickerBlockId)}
-              />
-              <View style={styles.dateModalCard}>
-                <DateTimePicker
-                  value={duePickerTemp}
-                  mode="date"
-                  display="spinner"
-                  themeVariant="light"
-                  minimumDate={new Date()}
-                  onChange={(_, d) => {
-                    if (d) setDuePickerTemp(d);
-                  }}
-                />
-                <View style={styles.dateModalActions}>
-                  <Pressable
-                    style={styles.dateModalBtn}
-                    onPress={() => closeDuePicker(duePickerBlockId)}>
-                    <Text style={styles.dateModalBtnMuted}>Cancel</Text>
-                  </Pressable>
-                  <Pressable style={styles.dateModalBtn} onPress={confirmDuePicker}>
-                    <Text style={styles.dateModalBtnStrong}>Done</Text>
-                  </Pressable>
-                </View>
-              </View>
-            </View>
-          </Modal>
-        ) : null}
       </View>
     </SafeAreaView>
   );
@@ -645,17 +773,33 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContentGrow: {
-    paddingHorizontal: 16,
     paddingTop: 10,
     paddingBottom: 24,
     flexGrow: 1,
   },
-  addRowFullWidth: {
+  /** Full remaining area under notes: one tappable surface (no fill; same bg as screen) */
+  addNoteArea: {
     width: '100%',
-    minHeight: 52,
-    paddingVertical: 18,
-    paddingHorizontal: 0,
-    justifyContent: 'center',
+    flexGrow: 1,
+    flexDirection: 'column',
+    alignItems: 'stretch',
+    alignSelf: 'stretch',
+    marginTop: 4,
+    paddingTop: 8,
+    paddingBottom: 8,
+  },
+  /** When there are no notes yet, stretch to fill the scroll body */
+  addNoteAreaFill: {
+    flex: 1,
+    minHeight: 200,
+  },
+  addNoteAreaPressed: {
+    opacity: 0.92,
+  },
+  addNoteAreaSpacer: {
+    flex: 1,
+    flexGrow: 1,
+    minHeight: 1,
   },
   addRowInner: {
     flexDirection: 'row',
@@ -663,75 +807,78 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-start',
     gap: 10,
     width: '100%',
-    paddingHorizontal: 0,
+    paddingHorizontal: 16,
   },
   addRowDisabled: {
     opacity: 0.42,
   },
-  belowNotesTap: {
-    flexGrow: 1,
-    minHeight: 160,
-  },
   noteBlock: {
     width: '100%',
+    alignSelf: 'stretch',
   },
-  noteRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 6,
-    minHeight: 48,
+  noteRowChrome: {
+    width: '100%',
   },
-  noteRowToolbar: {
+  /** Idle separator: hairline-thin, very light black. */
+  noteHairlineIdle: {
+    width: '100%',
+    height: StyleSheet.hairlineWidth,
+    minHeight: 1,
+    backgroundColor: NOTE_LINE_SUBTLE,
+  },
+  noteRowWrap: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    marginTop: 2,
-    marginBottom: 4,
-    paddingLeft: 2,
+    gap: 4,
+    minHeight: NOTE_ROW_MIN_HEIGHT,
+    paddingTop: 5,
+    paddingBottom: 5,
+    paddingHorizontal: 16,
+    width: '100%',
   },
-  toolBtn: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: BW.borderSoft,
-    backgroundColor: 'rgba(0,0,0,0.03)',
+  noteLeftCol: {
+    flex: 1,
+    minWidth: 0,
+    height: 40,
+    justifyContent: 'center',
   },
-  toolBtnText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: BW.muted,
-    letterSpacing: 0.3,
+  noteDueColumn: {
+    width: NOTE_DUE_SIZE,
+    height: NOTE_DUE_SIZE,
+    flexShrink: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  noteDueIndicatorRoot: {
+    marginTop: 0,
+    alignSelf: 'center',
   },
   blockInput: {
     flex: 1,
-    minHeight: 44,
-    paddingVertical: 12,
-    paddingHorizontal: 4,
+    width: '100%',
+    height: 40,
+    maxHeight: 40,
+    paddingVertical: 0,
+    paddingHorizontal: 0,
     fontSize: 17,
-    lineHeight: 24,
+    lineHeight: 20,
     color: BW.fg,
     backgroundColor: BW.bg,
+    overflow: 'hidden',
+    textAlign: 'left',
+    ...(Platform.OS === 'android' ? { includeFontPadding: false } : {}),
+    ...(Platform.OS === 'web'
+      ? ({
+          whiteSpace: 'nowrap',
+          textOverflow: 'ellipsis',
+        } as const)
+      : {}),
   },
-  blockDivider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: BW.hairline,
-    marginVertical: 6,
-    marginLeft: 0,
-  },
-  addSection: {
-    marginTop: 4,
-  },
-  faintLine: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: BW.hairline,
-    marginBottom: 10,
-    marginLeft: 0,
-  },
-  addRowText: {
-    fontSize: 14,
-    color: BW.muted,
-    letterSpacing: 0.2,
+  addRowTextEmphasis: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: BW.fg,
+    letterSpacing: 0.15,
   },
   headerLeftContainer: {
     paddingLeft: 4,
@@ -743,40 +890,45 @@ const styles = StyleSheet.create({
     gap: 2,
     flexShrink: 1,
     paddingRight: 4,
+    minHeight: 44,
+    justifyContent: 'flex-start',
   },
   headerDateBesideMenu: {
-    paddingVertical: 4,
+    paddingVertical: 0,
     paddingLeft: 4,
     minWidth: 0,
     flexShrink: 1,
+    justifyContent: 'center',
   },
   headerDateTextLeft: {
     color: BW.fg,
     fontSize: 16,
+    lineHeight: 20,
     fontWeight: '600',
     textAlign: 'left',
     flexShrink: 1,
     maxWidth: '100%',
+    ...(Platform.OS === 'android' ? { includeFontPadding: false } : {}),
+  },
+  headerRightRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 4,
   },
   headerRightContainer: {
     flexGrow: 0,
     flexShrink: 0,
-    paddingRight: 4,
-  },
-  headerRight: {
-    flexDirection: 'row',
+    justifyContent: 'center',
     alignItems: 'center',
-    justifyContent: 'flex-end',
-    gap: 8,
-    paddingRight: 10,
   },
   headerIconBtn: {
     padding: 6,
   },
   sortCircle: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: NOTE_DUE_SIZE,
+    height: NOTE_DUE_SIZE,
+    borderRadius: NOTE_DUE_SIZE / 2,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: BW.borderSoft,
     alignItems: 'center',
@@ -795,27 +947,35 @@ const styles = StyleSheet.create({
     right: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 12,
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
     paddingVertical: 4,
     backgroundColor: BW.bg,
     zIndex: 100,
     elevation: 100,
   },
-  accBtn: {
-    flex: 1,
-    minWidth: 0,
-    minHeight: 40,
-    paddingHorizontal: 8,
-    borderRadius: 10,
+  accAccessoryLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  accAccessoryRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  /** Same diameter as note due-date rings (`NOTE_DUE_SIZE`). */
+  accCircleBtn: {
+    width: NOTE_DUE_SIZE,
+    height: NOTE_DUE_SIZE,
+    borderRadius: NOTE_DUE_SIZE / 2,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(0,0,0,0.08)',
+    borderColor: BW.borderSoft,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.03)',
+    backgroundColor: BW.bg,
   },
-  sqBtnPressed: {
-    opacity: 0.88,
+  accCirclePressed: {
+    opacity: 0.72,
   },
   menuOverlay: {
     ...StyleSheet.absoluteFillObject,
@@ -851,42 +1011,5 @@ const styles = StyleSheet.create({
   menuDivider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: BW.hairline,
-  },
-  dateModalRoot: {
-    flex: 1,
-    justifyContent: 'flex-end',
-    backgroundColor: 'rgba(0,0,0,0.35)',
-  },
-  dateModalBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  dateModalCard: {
-    backgroundColor: BW.bg,
-    borderTopLeftRadius: 12,
-    borderTopRightRadius: 12,
-    paddingBottom: 24,
-    paddingTop: 8,
-  },
-  dateModalActions: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: BW.hairline,
-  },
-  dateModalBtn: {
-    paddingVertical: 12,
-    paddingHorizontal: 8,
-  },
-  dateModalBtnMuted: {
-    fontSize: 17,
-    color: BW.muted,
-  },
-  dateModalBtnStrong: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: BW.fg,
   },
 });

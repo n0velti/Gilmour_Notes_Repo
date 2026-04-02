@@ -33,7 +33,10 @@ export function AppDrawerContent(props: DrawerContentComponentProps) {
     <View style={styles.root}>
       <DrawerContentScrollView
         {...props}
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingTop: insets.top + 10 },
+        ]}
         style={styles.scroll}>
         <DrawerItem
           label="Notes"
@@ -105,7 +108,6 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContent: {
-    paddingTop: 8,
     paddingHorizontal: 4,
   },
   drawerItem: {
